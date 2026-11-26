@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/zcu-rs",
+    "crates/h168n-cli",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

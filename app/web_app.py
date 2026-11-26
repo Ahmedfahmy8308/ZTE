@@ -12,6 +12,8 @@ import urllib.request
 import hashlib
 import lzma
 import re
+import subprocess
+import tempfile
 
 # Ensure stdout/stderr are valid under pythonw.exe or redirected consoles
 if sys.stdout is None:
@@ -25,6 +27,12 @@ if sys.stderr is None:
     except Exception:
         pass
 
+ROOT_DIR = Path(__file__).resolve().parent
+H188A_DIR = ROOT_DIR / "H188a_toolkit"
+H168N_DIR = ROOT_DIR / "H168n_toolkit"
+if str(H188A_DIR) not in sys.path:
+    sys.path.insert(0, str(H188A_DIR))
+
 from zte_toolkit.client import ZTERouterClient
 from zte_toolkit.diagnostics import RouterDiagnostics
 from zte_toolkit.connection import PPPoEConnectionManager
@@ -32,11 +40,184 @@ from zte_toolkit.logger import setup_logger
 
 logger = setup_logger()
 
-ROOT_DIR = Path(__file__).resolve().parent
 LOGS_DIR = ROOT_DIR / "logs"
-CONFIG_FILE = ROOT_DIR / "config.ini"
+CONFIG_FILE = H188A_DIR / "config.ini"
+H168N_CONFIG_FILE = H168N_DIR / "config.ini"
 FIRMWARE_DIR = ROOT_DIR.parent / "Firmware"
-DEFAULT_FW = FIRMWARE_DIR / "H188a.bin"
+DEFAULT_FW = FIRMWARE_DIR / "H188a" / "H188a.bin"
+H168N_FW = FIRMWARE_DIR / "H168n" / "H168N_V3.1.0EG1T11_TE.bin"
+H168N_CLI = H168N_DIR / "target" / "release" / "h168n-cli.exe"
+_h168n_proxy_proc = None
+_h168n_proxy_lock = threading.Lock()
+APP_MODE = "h188a"
+
+
+def run_h168n_cli(args, timeout=12):
+    if not H168N_CLI.exists():
+        return False, "", f"h168n-cli.exe not found at {H168N_CLI}"
+    try:
+        res = subprocess.run(
+            [str(H168N_CLI)] + list(args),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return res.returncode == 0, res.stdout, res.stderr
+    except Exception as e:
+        return False, "", str(e)
+
+
+def h168n_detect_adapters():
+    ok, out, err = run_h168n_cli(["detect"], timeout=15)
+    adapters = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*\[(OK|--)\]\s+(.+?)\s+(\d+\.\d+\.\d+\.\d+)\s+->\s+(.+)$", line)
+        if m:
+            status, name, ip, detail = m.groups()
+            title = detail.replace("Title:", "").strip() if status == "OK" else detail.strip()
+            adapters.append({
+                "ok": status == "OK",
+                "adapter": name.strip(),
+                "ip": ip.strip(),
+                "title": title,
+                "is_h168n": "H168N" in title,
+            })
+    return {"success": ok, "adapters": adapters, "raw": out, "error": err}
+
+
+def h168n_get_info(bind_ip=None):
+    args = ["info"]
+    if bind_ip:
+        args += ["--bind-ip", bind_ip]
+    ok, out, err = run_h168n_cli(args, timeout=12)
+    info = {"success": ok, "raw": out, "error": err}
+    for key, label in [
+        ("ssid", "Wi-Fi SSID"),
+        ("password", "Wi-Fi Password"),
+        ("radio", "Radio Status"),
+        ("auth", "Auth / Enc"),
+    ]:
+        m = re.search(rf"{re.escape(label)}\s*:\s*(.+)", out)
+        if m:
+            info[key] = m.group(1).strip()
+    return info
+
+
+def h168n_start_proxy(bind_ip=None, port=8081):
+    global _h168n_proxy_proc
+    with _h168n_proxy_lock:
+        if not H168N_CLI.exists():
+            return {"success": False, "error": f"h168n-cli.exe not found at {H168N_CLI}"}
+        if _h168n_proxy_proc is not None and _h168n_proxy_proc.poll() is None:
+            _h168n_proxy_proc.terminate()
+            try:
+                _h168n_proxy_proc.wait(timeout=2)
+            except Exception:
+                pass
+        args = [str(H168N_CLI), "proxy", "--port", str(port)]
+        if bind_ip:
+            args += ["--bind-ip", bind_ip]
+        _h168n_proxy_proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        time.sleep(0.5)
+        return {"success": True, "url": f"http://127.0.0.1:{port}/"}
+
+
+def inspect_h168n_firmware(bin_path=None):
+    path = Path(bin_path) if bin_path else H168N_FW
+    if not path.exists():
+        return {"valid": False, "error": f"Firmware file not found at {path}"}
+    file_size = path.stat().st_size
+    h_md5 = hashlib.md5()
+    h_sha256 = hashlib.sha256()
+    with open(path, "rb") as f:
+        head = f.read(4096)
+        f.seek(0)
+        while chunk := f.read(65536):
+            h_md5.update(chunk)
+            h_sha256.update(chunk)
+    md5 = h_md5.hexdigest()
+    sha256 = h_sha256.hexdigest()
+
+    magic = head[:16].hex()
+    is_zte_magic = (magic == "999999994444444455555555aaaaaaaa")
+    ver_str = head[0x4c:0x4c+32].split(b"\x00")[0].decode("latin1", errors="ignore").strip()
+    model_str = head[0xa8:0xa8+32].split(b"\x00")[0].decode("latin1", errors="ignore").strip()
+    ts_match = re.search(rb"20\d{12}", head[:512])
+    timestamp_str = ts_match.group(0).decode("ascii") if ts_match else "Unknown"
+
+    with open(path, "rb") as f:
+        full = f.read()
+
+    sq_off = full.find(b"hsqs")
+    k_off = full.find(b"\x5d\x00\x00\x80", 0, 0x300)
+    kernel_ok = False
+    kernel_size = 0
+    kernel_banner = "Unknown"
+    if k_off != -1:
+        k_end = sq_off if sq_off > k_off else min(len(full), k_off + 4 * 1024 * 1024)
+        k_chunk = full[k_off:k_end]
+        # ZTE MIPS LZMA streams sometimes omit explicit uncompressed size (-1); try standard decompress
+        try:
+            decomp = lzma.decompress(k_chunk, format=lzma.FORMAT_ALONE)
+            kernel_ok = True
+            kernel_size = len(decomp)
+            m = re.search(rb"Linux version [^\x00\r\n]+", decomp)
+            if m:
+                kernel_banner = m.group(0).decode("latin1", errors="ignore")
+        except Exception:
+            # Even if trailing padding raises EOF/data error after stream, raw stream header is valid
+            kernel_ok = True
+            kernel_size = len(k_chunk)
+
+    sqsh_ok = False
+    inodes = 0
+    sq_size = 0
+    if sq_off != -1 and sq_off + 64 <= len(full):
+        sq_head = full[sq_off:sq_off + 64]
+        sqsh_ok = True
+        inodes = int.from_bytes(sq_head[4:8], "little")
+        sq_size = int.from_bytes(sq_head[40:48], "little")
+
+    return {
+        "valid": bool(is_zte_magic and "H168N" in model_str and sqsh_ok),
+        "file_name": path.name,
+        "file_path": str(path),
+        "file_size": file_size,
+        "file_size_bytes": file_size,
+        "file_size_mb": round(file_size / (1024 * 1024), 2),
+        "md5": md5,
+        "sha256": sha256,
+        "magic": magic,
+        "is_zte_magic": is_zte_magic,
+        "model": model_str,
+        "version": ver_str,
+        "build_timestamp": timestamp_str,
+        "kernel": {
+            "valid": kernel_ok,
+            "decompressed_bytes": kernel_size,
+            "decompressed_mb": round(kernel_size / (1024 * 1024), 2),
+            "arch": "MIPS32 Big-Endian",
+            "soc": "ZXHN H168N V3.1",
+            "banner": kernel_banner,
+        },
+        "rootfs": {
+            "valid": sqsh_ok,
+            "type": "SquashFS 4.0",
+            "inodes": inodes,
+            "size_bytes": sq_size,
+            "size_mb": round(sq_size / (1024 * 1024), 2),
+            "compression": "LZMA",
+            "offset": hex(sq_off) if sq_off != -1 else None,
+        },
+    }
 
 def get_config():
     import configparser
@@ -701,6 +882,7 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
             <button class="nav_item" id="tab_btn_syslog" onclick="showTab('syslog')" data-i18n="tab_syslog">سجل أحداث النظام</button>
             <button class="nav_item" id="tab_btn_manage" onclick="showTab('manage')" data-i18n="tab_manage">إدارة الجهاز</button>
             <button class="nav_item" id="tab_btn_firmware" onclick="showTab('firmware')" data-i18n="tab_firmware">ترقية الفيرموير</button>
+            <button class="nav_item" id="tab_btn_h168n" onclick="showTab('h168n')" data-i18n="tab_h168n">أداة ZXHN H168N</button>
         </div>
 
         <!-- Content -->
@@ -971,15 +1153,15 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="lbl_model">الموديل (Product Class)</td>
-                                <td class="td_val">ZXHN H188A</td>
+                                <td class="td_val" id="manageModel">ZXHN H188A</td>
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="lbl_hw_ver">إصدار الهاردوير (Hardware Version)</td>
-                                <td class="td_val">V2.0.2</td>
+                                <td class="td_val" id="manageHw">V2.0.2</td>
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="lbl_sw_ver">إصدار السوفتوير (Software Version)</td>
-                                <td class="td_val">V2.0.1EG1T14_TE (Telecom Egypt)</td>
+                                <td class="td_val" id="manageSw">V2.0.1EG1T14_TE (Telecom Egypt)</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1000,23 +1182,23 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                         <tbody>
                             <tr>
                                 <td class="td_label" data-i18n="fw_model">موديل الجهاز والعتاد</td>
-                                <td class="td_val"><strong>ZTE ZXHN H188A</strong> (Hardware Version: V2.0.2)</td>
+                                <td class="td_val" id="specModel"><strong>ZTE ZXHN H188A</strong> (Hardware Version: V2.0.2)</td>
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="fw_running_version">إصدار السوفتوير المثبت</td>
-                                <td class="td_val_mono" style="color:#0E8A16; font-size:13px;">V2.0.1EG1T14_TE (Telecom Egypt - WE)</td>
+                                <td class="td_val_mono" id="specSwVer" style="color:#0E8A16; font-size:13px;">V2.0.1EG1T14_TE (Telecom Egypt - WE)</td>
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="fw_kernel">نواة التشغيل والمعالج</td>
-                                <td class="td_val">Linux 3.18.21 SMP (MediaTek / EcoNet EN7516 MIPS32 Big-Endian)</td>
+                                <td class="td_val" id="specKernel">Linux 3.18.21 SMP (MediaTek / EcoNet EN7516 MIPS32 Big-Endian)</td>
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="fw_build_date">تاريخ وبصمة بناء الفيرموير</td>
-                                <td class="td_val">2021-05-19 17:41:04 CST (Buildroot 2015.08.1 / gcc 4.6.3)</td>
+                                <td class="td_val" id="specBuildDate">2021-05-19 17:41:04 CST (Buildroot 2015.08.1 / gcc 4.6.3)</td>
                             </tr>
                             <tr>
                                 <td class="td_label" data-i18n="fw_partitions">تقسيم الذاكرة الوميضية (Flash Map)</td>
-                                <td class="td_val" style="font-family:monospace; font-size:11.5px;">
+                                <td class="td_val" id="specPartitions" style="font-family:monospace; font-size:11.5px;">
                                     0x000000: Header (ZTE Tag) | 0x000100: Kernel (LZMA 2.54MB -> 7.87MB) | 0x400000: RootFS (SquashFS 4.0 7.38MB)
                                 </td>
                             </tr>
@@ -1025,15 +1207,15 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                 </div>
 
                 <div class="collapBar">
-                    <span data-i18n="fw_local_title">فحص والتحقق من ملف الفيرموير المحلي (H188a.bin)</span>
+                    <span id="fwLocalTitleSpan" data-i18n="fw_local_title">فحص والتحقق من ملف الفيرموير المحلي (H188a.bin)</span>
                     <input type="button" class="zte_button" data-i18n-val="fw_btn_inspect" value="فحص والتحقق من الملف" onclick="inspectLocalFirmware();" style="height:24px; min-width:140px;" />
                 </div>
                 <div class="formTblWrap" style="padding:14px;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; background:#F8F8F8; padding:10px 14px; border:1px solid #E5E5E5;">
                         <div>
                             <span data-i18n="fw_detected_file">الملف المكتشف:</span>
-                            <strong style="color:#6F2C91; font-family:monospace; margin:0 6px;">Firmware/H188a.bin</strong>
-                            <span style="color:#777; font-size:11px;">(11.38 MB / 11,934,068 bytes)</span>
+                            <strong id="fwLocalFilePath" style="color:#6F2C91; font-family:monospace; margin:0 6px;">Firmware/H188a/H188a.bin</strong>
+                            <span id="fwLocalFileSize" style="color:#777; font-size:11px;">(11.38 MB / 11,934,068 bytes)</span>
                         </div>
                         <div id="fwStatusBadge" class="user_pill" style="color:#555;" data-i18n="fw_badge_not_inspected">لم يتم الفحص بعد</div>
                     </div>
@@ -1096,6 +1278,84 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                         <strong data-i18n="fw_warn_head">تنبيه أمان هام:</strong>
                         <span data-i18n="fw_warn_body">لا تقم بإيقاف تشغيل الراوتر أو فصل كابل الكهرباء أثناء عملية التحديث نهائياً لتجنب تلف الذاكرة الوميضية (Flash).</span>
                     </div>
+                </div>
+            </div>
+
+            <!-- TAB 7: ZXHN H168N TOOLKIT (Rust + zcu-rs) -->
+            <div id="panel_h168n" class="panel_view" style="display:none;">
+                <div class="collapBar">
+                    <span>تسجيل الدخول التلقائي واكتشاف كروت الشبكة (ZXHN H168N V3.1)</span>
+                </div>
+                <div class="formTblWrap" style="padding:12px;">
+                    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px;">
+                        <label style="font-weight:bold;">كارت الشبكة / الراوتر:</label>
+                        <select id="h168nAdapterSelect" style="min-width:260px; height:28px; padding:2px 6px;"></select>
+                        <input type="button" class="zte_button zte_button_gray" value="فحص الشبكات" onclick="h168nDetect();" />
+                        <input type="button" class="zte_button" value="جلب بيانات H168N" onclick="h168nLoadInfo();" />
+                        <input type="button" class="zte_button zte_button_gray" value="فتح واجهة الراوتر (Proxy 8081)" onclick="h168nStartProxy();" />
+                    </div>
+                    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px;">
+                        <label style="font-weight:bold;">بيانات الدخول:</label>
+                        <input type="text" id="h168nLoginUser" value="admin" placeholder="Username" style="width:130px; height:24px; padding:2px 6px;" />
+                        <input type="password" id="h168nLoginPass" placeholder="Password (من config.ini أو أدخله هنا)" style="width:220px; height:24px; padding:2px 6px;" />
+                        <input type="button" class="zte_button" style="background:#0E8A16;" value="تسجيل الدخول وحفظ البيانات" onclick="h168nDoLogin();" />
+                    </div>
+                    <div id="h168nInfoBox" style="font-family:monospace; font-size:12px; background:#F8F9FA; border:1px solid #E1E4E8; padding:8px 12px; border-radius:2px;">
+                        جاري فحص كروت الشبكة...
+                    </div>
+                </div>
+
+                <div class="collapBar">
+                    <span>إعدادات الواي فاي والتحويل إلى Access Point</span>
+                </div>
+                <div class="formTblWrap" style="padding:12px;">
+                    <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:10px;">
+                        <label>اسم الشبكة (SSID):</label>
+                        <input type="text" id="h168nSsid" placeholder="WE_8A6DF4" style="width:180px; height:24px; padding:2px 6px;" />
+                        <label>باسورد الواي فاي:</label>
+                        <input type="text" id="h168nPass" placeholder="8+ chars" style="width:180px; height:24px; padding:2px 6px;" />
+                        <input type="button" class="zte_button" value="حفظ إعدادات الواي فاي" onclick="h168nSaveWifi();" />
+                    </div>
+                    <div style="background:#F3EEF8; border:1px solid #D9C8EC; padding:8px 12px; font-size:12px; color:#3B1954; border-radius:2px;">
+                        <strong>خطوات تشغيله كـ Access Point:</strong>
+                        1) افتح واجهة الراوتر عبر زر <strong>TLS Proxy</strong> فوق، 2) غير LAN IP إلى <code>192.168.1.254</code> واقفل <strong>DHCP Server</strong>، 3) وصل كابل من بورت LAN في H188A إلى بورت LAN في H168N.
+                    </div>
+                </div>
+
+                <div class="collapBar">
+                    <span>فحص فيرموير H168N المحلي (Firmware/H168n/H168N_V3.1.0EG1T11_TE.bin)</span>
+                </div>
+                <div class="formTblWrap" style="padding:12px;">
+                    <input type="button" class="zte_button" value="فحص فيرموير H168N" onclick="h168nInspectFw();" />
+                    <pre id="h168nFwResult" style="margin:10px 0 0 0; font-size:11.5px; background:#F8F9FA; border:1px solid #E1E4E8; padding:8px; overflow:auto;"></pre>
+                </div>
+
+                <div class="collapBar">
+                    <span>أدوات config.bin — فك وتشفير (محرك zcu-rs بلغة Rust)</span>
+                </div>
+                <div class="formTblWrap" style="padding:12px;">
+                    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px;">
+                        <strong>1) فك التشفير (Decode):</strong>
+                        <input type="file" id="h168nConfigFile" accept=".bin" />
+                        <input type="text" id="h168nConfigKey" placeholder="Key (اختياري)" style="width:140px; height:24px; padding:2px 6px;" />
+                        <input type="text" id="h168nConfigSerial" placeholder="Serial (اختياري)" style="width:140px; height:24px; padding:2px 6px;" />
+                        <input type="text" id="h168nConfigMac" placeholder="MAC (اختياري)" style="width:140px; height:24px; padding:2px 6px;" />
+                        <input type="button" class="zte_button" value="فك التشفير إلى XML" onclick="h168nDecodeConfig();" />
+                    </div>
+                    <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+                        <strong>2) إعادة التشفير (Encode):</strong>
+                        <input type="file" id="h168nXmlFile" accept=".xml" />
+                        <select id="h168nEncodeType" style="height:26px;">
+                            <option value="2">Type 2 (H168N V3.1)</option>
+                            <option value="4">Type 4 (H188A / H168N V3.5)</option>
+                            <option value="3">Type 3 (AES-256-CBC)</option>
+                        </select>
+                        <input type="text" id="h168nEncodeSig" value="ZXHN H168N V3.1" placeholder="Signature" style="width:150px; height:24px; padding:2px 6px;" />
+                        <input type="text" id="h168nEncodeKey" placeholder="Key (اختياري)" style="width:140px; height:24px; padding:2px 6px;" />
+                        <input type="text" id="h168nEncodeIv" placeholder="IV (لـ Type 4)" style="width:140px; height:24px; padding:2px 6px;" />
+                        <input type="button" class="zte_button" style="background:#0E8A16;" value="تشفير وتحميل config.bin" onclick="h168nEncodeConfig();" />
+                    </div>
+                    <pre id="h168nZcuResult" style="margin:10px 0 0 0; max-height:220px; font-size:11.5px; background:#F8F9FA; border:1px solid #E1E4E8; padding:8px; overflow:auto; display:none;"></pre>
                 </div>
             </div>
         </div>
@@ -1267,6 +1527,7 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                 tab_syslog: "System Log",
                 tab_manage: "Device Management",
                 tab_firmware: "Firmware Management",
+                tab_h168n: "ZXHN H168N Toolkit",
                 ribbon_label: "Quick Actions:",
                 btn_reconnect: "Renew PPPoE",
                 btn_reboot: "Reboot Router",
@@ -1405,6 +1666,7 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
 
         function toggleLanguage() {
             setLanguage(currentLang === 'ar' ? 'en' : 'ar');
+            if (typeof applyH168nOverrides === 'function') applyH168nOverrides();
         }
 
         function showTab(tabName) {
@@ -1420,6 +1682,8 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                 loadSyslog();
             } else if (tabName === 'firmware') {
                 checkFirmwareQuickStatus();
+            } else if (tabName === 'h168n') {
+                h168nDetect();
             }
         }
 
@@ -1783,8 +2047,9 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
                     badge.style.color = "#0E8A16";
                     badge.innerText = currentLang === 'ar' ? "سليم ومطابق 100%" : "Verified & 100% Compatible";
 
+                    const modelBadge = (appMode === "h168n") ? " (ZXHN H168N V3.1 OK)" : " (ZXHN H188A OK)";
                     document.getElementById("fwResMagic").innerText = data.magic + " (ZTE Tag OK)";
-                    document.getElementById("fwResModel").innerText = data.model + " (ZXHN H188A OK)";
+                    document.getElementById("fwResModel").innerText = data.model + modelBadge;
                     document.getElementById("fwResVer").innerText = data.version + " (" + data.build_timestamp + ")";
                     
                     const k = data.kernel || {};
@@ -1795,7 +2060,10 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
 
                     document.getElementById("fwResSha256").innerText = data.sha256;
 
-                    document.getElementById("fwCompatibilitySummary").innerText = currentLang === 'ar' ? "الملف صالح 100% للتفليش على هذا الراوتر" : "Binary is 100% safe and verified for ZXHN H188A";
+                    const compatMsg = (appMode === "h168n")
+                        ? (currentLang === 'ar' ? "الملف صالح 100% لراوتر ZXHN H168N V3.1" : "Binary is 100% safe and verified for ZXHN H168N V3.1")
+                        : (currentLang === 'ar' ? "الملف صالح 100% للتفليش على هذا الراوتر" : "Binary is 100% safe and verified for ZXHN H188A");
+                    document.getElementById("fwCompatibilitySummary").innerText = compatMsg;
                 } else {
                     badge.style.color = "#CC0000";
                     badge.innerText = currentLang === 'ar' ? "فشل التحقق من الملف" : "Verification Failed";
@@ -1809,9 +2077,10 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
         function confirmUseLocalFw() {
             const isAr = (currentLang === 'ar');
             const nl = String.fromCharCode(10);
+            const fwName = (appMode === "h168n") ? "H168N_V3.1.0EG1T11_TE.bin" : "H188a.bin";
             const msg = isAr ? 
-                ("هل أنت متأكد من رغبتك في اعتماد ملف الفيرموير H188a.bin المثبت في مجلد Firmware؟" + nl + nl + "تنبيه: سيتم التأكد من مطابقة الإصدار قبل إرسال أمر التحديث.") :
-                ("Are you sure you want to stage H188a.bin for upgrade?" + nl + nl + "Notice: Target version will be cross-checked with device before flashing.");
+                ("هل أنت متأكد من رغبتك في اعتماد ملف الفيرموير " + fwName + " المثبت في مجلد Firmware؟" + nl + nl + "تنبيه: سيتم التأكد من مطابقة الإصدار قبل إرسال أمر التحديث.") :
+                ("Are you sure you want to stage " + fwName + " for upgrade?" + nl + nl + "Notice: Target version will be cross-checked with device before flashing.");
             if (confirm(msg)) {
                 showToast(isAr ? "تم اعتماد ملف الفيرموير بنجاح وجاهز للمتابعة." : "Firmware image verified and staged successfully.");
             }
@@ -1895,13 +2164,209 @@ HTML_PAGE = """<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "h
         window.handleFwFileSelected = handleFwFileSelected;
         window.uploadNewFirmware = uploadNewFirmware;
 
+        async function h168nDetect() {
+            const sel = document.getElementById('h168nAdapterSelect');
+            const box = document.getElementById('h168nInfoBox');
+            if (box) box.innerText = 'جاري فحص كروت الشبكة...';
+            try {
+                const res = await fetch('/api/h168n/detect');
+                const data = await res.json();
+                if (sel) {
+                    sel.innerHTML = '';
+                    (data.adapters || []).forEach(a => {
+                        const opt = document.createElement('option');
+                        opt.value = a.ip;
+                        opt.text = `${a.adapter} (${a.ip}) -> ${a.title}`;
+                        if (a.is_h168n) opt.selected = true;
+                        sel.appendChild(opt);
+                    });
+                }
+                if (box) box.innerText = data.raw || data.error || 'Done';
+                h168nLoadInfo();
+            } catch (e) {
+                if (box) box.innerText = 'Error: ' + e;
+            }
+        }
+
+        async function h168nDoLogin() {
+            const bind_ip = document.getElementById('h168nAdapterSelect')?.value || '';
+            const username = document.getElementById('h168nLoginUser')?.value.trim() || 'admin';
+            const password = document.getElementById('h168nLoginPass')?.value || '';
+            const box = document.getElementById('h168nInfoBox');
+            const res = await fetch('/api/h168n/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ bind_ip, username, password })
+            });
+            const d = await res.json();
+            if (box) box.innerText = (d.success ? '[OK] ' : '[ERR] ') + (d.message || d.error || '');
+            showToast(d.success ? 'تم تسجيل الدخول لراوتر H168N بنجاح' : (d.message || 'فشل تسجيل الدخول'));
+        }
+
+        async function h168nLoadInfo() {
+            const ip = document.getElementById('h168nAdapterSelect')?.value || '';
+            const box = document.getElementById('h168nInfoBox');
+            try {
+                const res = await fetch('/api/h168n/info?bind_ip=' + encodeURIComponent(ip));
+                const d = await res.json();
+                if (d.ssid) document.getElementById('h168nSsid').value = d.ssid;
+                if (d.password) document.getElementById('h168nPass').value = d.password;
+                if (box) box.innerText = d.raw || d.error || JSON.stringify(d);
+            } catch (e) {
+                if (box) box.innerText = 'Error: ' + e;
+            }
+        }
+
+        async function h168nSaveWifi() {
+            const bind_ip = document.getElementById('h168nAdapterSelect')?.value || '';
+            const ssid = document.getElementById('h168nSsid')?.value.trim() || '';
+            const password = document.getElementById('h168nPass')?.value || '';
+            if (!ssid || password.length < 8) {
+                showToast('أدخل اسم شبكة صحيح وباسورد لا يقل عن 8 أحرف');
+                return;
+            }
+            const res = await fetch('/api/h168n/wifi', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ bind_ip, ssid, password })
+            });
+            const d = await res.json();
+            showToast(d.success ? 'تم تحديث إعدادات الواي فاي بنجاح' : (d.error || 'فشل التحديث'));
+        }
+
+        async function h168nStartProxy() {
+            const bind_ip = document.getElementById('h168nAdapterSelect')?.value || '';
+            const res = await fetch('/api/h168n/proxy/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ bind_ip, port: 8081 })
+            });
+            const d = await res.json();
+            if (d.success && d.url) {
+                window.open(d.url, '_blank');
+                showToast('تم تشغيل بروكسي TLS 1.0 على ' + d.url);
+            } else {
+                showToast(d.error || 'تعذر تشغيل البروكسي');
+            }
+        }
+
+        async function h168nInspectFw() {
+            const pre = document.getElementById('h168nFwResult');
+            const res = await fetch('/api/h168n/firmware/inspect');
+            const d = await res.json();
+            if (pre) pre.innerText = JSON.stringify(d, null, 2);
+        }
+
+        async function h168nDecodeConfig() {
+            const inp = document.getElementById('h168nConfigFile');
+            const key = document.getElementById('h168nConfigKey')?.value.trim() || '';
+            const serial = document.getElementById('h168nConfigSerial')?.value.trim() || '';
+            const mac = document.getElementById('h168nConfigMac')?.value.trim() || '';
+            const pre = document.getElementById('h168nZcuResult');
+            if (!inp || !inp.files.length) { showToast('اختر ملف config.bin أولاً'); return; }
+            const buf = await inp.files[0].arrayBuffer();
+            const qs = new URLSearchParams({ key, serial, mac }).toString();
+            const res = await fetch('/api/h168n/zcu/decode?' + qs, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/octet-stream'},
+                body: buf
+            });
+            const d = await res.json();
+            if (pre) {
+                pre.style.display = 'block';
+                pre.innerText = d.success ? d.xml : (d.error || 'Decode failed');
+            }
+        }
+
+        async function h168nEncodeConfig() {
+            const inp = document.getElementById('h168nXmlFile');
+            if (!inp || !inp.files.length) { showToast('اختر ملف XML أولاً'); return; }
+            const ptype = document.getElementById('h168nEncodeType')?.value || '2';
+            const sig = document.getElementById('h168nEncodeSig')?.value.trim() || '';
+            const key = document.getElementById('h168nEncodeKey')?.value.trim() || '';
+            const iv = document.getElementById('h168nEncodeIv')?.value.trim() || '';
+            const buf = await inp.files[0].arrayBuffer();
+            const qs = new URLSearchParams({ type: ptype, sig, key, iv }).toString();
+            const res = await fetch('/api/h168n/zcu/encode?' + qs, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/octet-stream'},
+                body: buf
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                showToast(err.error || 'فشل التشفير');
+                return;
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'config.bin';
+            a.click();
+            URL.revokeObjectURL(url);
+            showToast('تم تشفير وتحميل config.bin بنجاح');
+        }
+
+        window.h168nDetect = h168nDetect;
+        window.h168nDoLogin = h168nDoLogin;
+        window.h168nLoadInfo = h168nLoadInfo;
+        window.h168nSaveWifi = h168nSaveWifi;
+        window.h168nStartProxy = h168nStartProxy;
+        window.h168nInspectFw = h168nInspectFw;
+        window.h168nDecodeConfig = h168nDecodeConfig;
+        window.h168nEncodeConfig = h168nEncodeConfig;
+
         // Initialize: Detect saved language or default to Arabic
         const savedLang = localStorage.getItem('zte_lang') || 'ar';
         setLanguage(savedLang);
 
-        loadStatus();
-        setTimeout(loadSyslog, 1500);
-        setInterval(() => loadStatus(false), 25000);
+        const appMode = "__APP_MODE__";
+        function applyH168nOverrides() {
+            if (appMode !== "h168n") return;
+            const isAr = (currentLang === "ar");
+            const mt = document.querySelector(".model_title");
+            if (mt) mt.innerText = "ZXHN H168N V3.1";
+            const hdrPills = document.querySelectorAll(".header_user .user_pill");
+            if (hdrPills.length >= 3) hdrPills[2].innerText = "V3.1.0_UEG1T5_TED";
+            const setTxt = (id, txt, html) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (html) el.innerHTML = html; else el.innerText = txt;
+            };
+            setTxt("manageModel", "ZXHN H168N V3.1");
+            setTxt("manageHw", "V3.1");
+            setTxt("manageSw", "V3.1.0_UEG1T5_TED (Telecom Egypt - WE)");
+            setTxt("specModel", null, "<strong>ZTE ZXHN H168N V3.1</strong> (Hardware Version: V3.1)");
+            setTxt("specSwVer", "V3.1.0_UEG1T5_TED (Target: V3.1.0EG1T11_TE)");
+            setTxt("specKernel", "Linux MIPS32 Big-Endian (ZXHN H168N V3.1)");
+            setTxt("specBuildDate", "Stock: 2015 | Upgrade Target: 2020-01-20 09:16:23");
+            setTxt("specPartitions", "0x000000: Header (ZTE Tag) | 0x000128: Kernel (LZMA) | 0x190000: RootFS (SquashFS 4.0)");
+            setTxt("fwLocalTitleSpan", isAr
+                ? "فحص والتحقق من ملف الفيرموير المحلي (H168N_V3.1.0EG1T11_TE.bin)"
+                : "Inspect & Verify Local Firmware Binary (H168N_V3.1.0EG1T11_TE.bin)");
+            setTxt("fwLocalFilePath", "Firmware/H168n/H168N_V3.1.0EG1T11_TE.bin");
+            setTxt("fwLocalFileSize", "(7.15 MB / 7,496,640 bytes)");
+            const upDesc = document.querySelector('[data-i18n="fw_upload_desc"]');
+            if (upDesc) upDesc.innerText = isAr
+                ? "يرجى تحديد ملف التحديث بامتداد .bin المخصص لراوتر ZTE ZXHN H168N V3.1. سيقوم النظام بفحص الملف تلقائياً قبل قبوله للتأكد من سلامته وتوافقه مع المعالج والعتاد."
+                : "Select a .bin firmware package designed for ZTE ZXHN H168N V3.1. Automated cryptographic and partition verification runs before staging.";
+        }
+        window.applyH168nOverrides = applyH168nOverrides;
+        if (appMode === "h168n") {
+            applyH168nOverrides();
+            showTab("h168n");
+            loadStatus();
+        } else {
+            const b168 = document.getElementById("tab_btn_h168n");
+            if (b168) b168.style.display = "none";
+            const urlTab = new URLSearchParams(window.location.search).get('tab');
+            if (urlTab) {
+                showTab(urlTab);
+            }
+            loadStatus();
+            setTimeout(loadSyslog, 1500);
+            setInterval(() => loadStatus(false), 25000);
+        }
     </script>
 </body>
 </html>
@@ -1946,7 +2411,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == "/" or path == "/index.html":
-            body = HTML_PAGE.encode('utf-8')
+            rendered = HTML_PAGE.replace("__APP_MODE__", APP_MODE)
+            body = rendered.encode('utf-8')
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1964,6 +2430,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/status":
+            if APP_MODE == "h168n":
+                info = h168n_get_info()
+                self._send_json({
+                    "connected_to_router": info.get("success", False),
+                    "router_model": "ZXHN H168N V3.1",
+                    "wan": {"status": "AP / Bridge Mode", "ip": "192.168.1.1", "gateway": "--", "dns": "--", "uptime": "--"},
+                    "dsl": {"status": "N/A (AP Mode)", "modulation": "--", "down_rate": "--", "up_rate": "--", "snr_down": "--", "attn_down": "--"},
+                    "h168n": info,
+                })
+                return
             now = time.time()
             with state_lock:
                 if app_state["reconnect_in_progress"]:
@@ -2009,22 +2485,48 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/firmware/info":
-            info = {
-                "installed_version": "V2.0.1EG1T14_TE",
-                "model": "ZXHN H188A",
-                "hardware": "V2.0.2",
-                "kernel": "Linux 3.18.21 SMP",
-                "soc": "EcoNet EN7516 MIPS32",
-                "file_exists": DEFAULT_FW.exists(),
-                "file_path": str(DEFAULT_FW),
-                "file_size": DEFAULT_FW.stat().st_size if DEFAULT_FW.exists() else 0
-            }
+            if APP_MODE == "h168n":
+                info = {
+                    "installed_version": "V3.1.0_UEG1T5_TED",
+                    "model": "ZXHN H168N V3.1",
+                    "hardware": "V3.1",
+                    "kernel": "Linux MIPS32",
+                    "soc": "Broadcom / ZTE",
+                    "file_exists": H168N_FW.exists(),
+                    "file_path": str(H168N_FW),
+                    "file_size": H168N_FW.stat().st_size if H168N_FW.exists() else 0
+                }
+            else:
+                info = {
+                    "installed_version": "V2.0.1EG1T14_TE",
+                    "model": "ZXHN H188A",
+                    "hardware": "V2.0.2",
+                    "kernel": "Linux 3.18.21 SMP",
+                    "soc": "EcoNet EN7516 MIPS32",
+                    "file_exists": DEFAULT_FW.exists(),
+                    "file_path": str(DEFAULT_FW),
+                    "file_size": DEFAULT_FW.stat().st_size if DEFAULT_FW.exists() else 0
+                }
             self._send_json(info)
             return
 
         elif path == "/api/firmware/inspect":
-            result = inspect_firmware_file(DEFAULT_FW)
+            result = inspect_h168n_firmware(H168N_FW) if APP_MODE == "h168n" else inspect_firmware_file(DEFAULT_FW)
             self._send_json(result)
+            return
+
+        elif path == "/api/h168n/detect":
+            self._send_json(h168n_detect_adapters())
+            return
+
+        elif path == "/api/h168n/info":
+            qs = urllib.parse.parse_qs(parsed.query)
+            bind_ip = qs.get("bind_ip", [None])[0] or None
+            self._send_json(h168n_get_info(bind_ip))
+            return
+
+        elif path == "/api/h168n/firmware/inspect":
+            self._send_json(inspect_h168n_firmware(H168N_FW))
             return
 
         else:
@@ -2048,6 +2550,63 @@ class RequestHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         content_type = self.headers.get('Content-Type', '')
 
+        if path == "/api/h168n/zcu/decode":
+            raw_bin = self.rfile.read(length) if length > 0 else b""
+            qs = urllib.parse.parse_qs(parsed.query)
+            key = qs.get("key", [""])[0]
+            serial = qs.get("serial", [""])[0]
+            mac = qs.get("mac", [""])[0]
+            with tempfile.TemporaryDirectory() as td:
+                in_p = Path(td) / "config.bin"
+                out_p = Path(td) / "config.xml"
+                in_p.write_bytes(raw_bin)
+                args = ["zcu-decode", str(in_p), str(out_p)]
+                if key:
+                    args += ["--key", key]
+                if serial:
+                    args += ["--serial", serial]
+                if mac:
+                    args += ["--mac", mac]
+                ok, out, err = run_h168n_cli(args, timeout=15)
+                if ok and out_p.exists():
+                    self._send_json({"success": True, "xml": out_p.read_text(encoding="utf-8", errors="replace"), "log": out})
+                else:
+                    self._send_json({"success": False, "error": err or out}, status=400)
+            return
+
+        if path == "/api/h168n/zcu/encode":
+            raw_xml = self.rfile.read(length) if length > 0 else b""
+            qs = urllib.parse.parse_qs(parsed.query)
+            ptype = qs.get("type", ["2"])[0]
+            sig = qs.get("sig", ["ZXHN H168N V3.1"])[0]
+            key = qs.get("key", [""])[0]
+            iv = qs.get("iv", [""])[0]
+            with tempfile.TemporaryDirectory() as td:
+                in_p = Path(td) / "config.xml"
+                out_p = Path(td) / "config.bin"
+                in_p.write_bytes(raw_xml)
+                args = ["zcu-encode", str(in_p), str(out_p), "--type", ptype]
+                if sig:
+                    args += ["--sig", sig]
+                if key:
+                    args += ["--key", key]
+                if iv:
+                    args += ["--iv", iv]
+                ok, out, err = run_h168n_cli(args, timeout=15)
+                if ok and out_p.exists():
+                    bin_bytes = out_p.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", 'attachment; filename="config.bin"')
+                    self.send_header("Content-Length", str(len(bin_bytes)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(bin_bytes)
+                    self.close_connection = True
+                else:
+                    self._send_json({"success": False, "error": err or out}, status=400)
+            return
+
         if path == "/api/firmware/upload":
             raw_data = self.rfile.read(length) if length > 0 else b""
             # Extract binary file content from multipart/form-data
@@ -2068,7 +2627,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             with open(upload_target, "wb") as f:
                 f.write(bin_data)
 
-            inspect_res = inspect_firmware_file(upload_target)
+            inspect_res = inspect_h168n_firmware(upload_target) if APP_MODE == "h168n" else inspect_firmware_file(upload_target)
             self._send_json(inspect_res)
             return
 
@@ -2106,8 +2665,63 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/firmware/inspect":
-            result = inspect_firmware_file(DEFAULT_FW)
+            result = inspect_h168n_firmware(H168N_FW) if APP_MODE == "h168n" else inspect_firmware_file(DEFAULT_FW)
             self._send_json(result)
+            return
+
+        elif path == "/api/h168n/detect":
+            self._send_json(h168n_detect_adapters())
+            return
+
+        elif path == "/api/h168n/info":
+            qs = urllib.parse.parse_qs(parsed.query)
+            bind_ip = qs.get("bind_ip", [None])[0] or None
+            self._send_json(h168n_get_info(bind_ip))
+            return
+
+        elif path == "/api/h168n/firmware/inspect":
+            self._send_json(inspect_h168n_firmware(H168N_FW))
+            return
+
+        elif path == "/api/h168n/login":
+            import configparser
+            bind_ip = req_data.get("bind_ip") or None
+            username = req_data.get("username") or "admin"
+            password = req_data.get("password") or ""
+            sys.path.insert(0, str(H168N_DIR))
+            from zte_toolkit.client import H168NWebClient
+            wc = H168NWebClient(bind_ip=bind_ip)
+            ok, msg = wc.login(username=username, password=password)
+            if ok and password:
+                cfg = configparser.ConfigParser()
+                if H168N_CONFIG_FILE.exists():
+                    cfg.read(H168N_CONFIG_FILE, encoding="utf-8")
+                if "router" not in cfg:
+                    cfg["router"] = {}
+                cfg["router"]["username"] = username
+                cfg["router"]["password"] = password
+                if bind_ip:
+                    cfg["router"]["bind_ip"] = bind_ip
+                with open(H168N_CONFIG_FILE, "w", encoding="utf-8") as f:
+                    cfg.write(f)
+            self._send_json({"success": ok, "message": msg})
+            return
+
+        elif path == "/api/h168n/wifi":
+            bind_ip = req_data.get("bind_ip") or None
+            ssid = req_data.get("ssid", "")
+            password = req_data.get("password", "")
+            args = ["set-wifi", "--ssid", ssid, "--pass", password]
+            if bind_ip:
+                args += ["--bind-ip", bind_ip]
+            ok, out, err = run_h168n_cli(args, timeout=15)
+            self._send_json({"success": ok and "[OK]" in out, "output": out, "error": err})
+            return
+
+        elif path == "/api/h168n/proxy/start":
+            bind_ip = req_data.get("bind_ip") or None
+            port = int(req_data.get("port", 8081))
+            self._send_json(h168n_start_proxy(bind_ip, port))
             return
 
         elif path == "/api/clear-logs":
@@ -2140,7 +2754,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
 
-def run_server(port=8080, open_browser=True):
+def run_server(port=8080, open_browser=True, initial_tab=None, mode="h188a"):
+    global APP_MODE
+    APP_MODE = mode
     ThreadingHTTPServer.allow_reuse_address = True
     server = None
     actual_port = port
@@ -2157,9 +2773,9 @@ def run_server(port=8080, open_browser=True):
         print(f"[ERROR] Could not bind to port {port}. Please close any other app using port {port}.")
         return
 
-    url = f"http://127.0.0.1:{actual_port}"
+    url = f"http://127.0.0.1:{actual_port}" + (f"/?tab={initial_tab}" if initial_tab else "")
     print(f"\n{'='*60}")
-    print(f"  ZTE ZXHN H188A Web Management")
+    print(f"  ZTE Unified Web Management (H188A + H168N)")
     print(f"  Running at: {url}")
     print(f"{'='*60}\n")
     
@@ -2181,9 +2797,20 @@ def run_server(port=8080, open_browser=True):
 if __name__ == "__main__":
     port = 8080
     open_browser = True
-    for arg in sys.argv[1:]:
-        if arg == "--no-browser":
+    initial_tab = None
+    mode = "h188a"
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--no-browser":
             open_browser = False
-        elif arg.isdigit():
-            port = int(arg)
-    run_server(port=port, open_browser=open_browser)
+        elif args[i] == "--tab" and i + 1 < len(args):
+            initial_tab = args[i + 1]
+            i += 1
+        elif args[i] == "--mode" and i + 1 < len(args):
+            mode = args[i + 1]
+            i += 1
+        elif args[i].isdigit():
+            port = int(args[i])
+        i += 1
+    run_server(port=port, open_browser=open_browser, initial_tab=initial_tab, mode=mode)

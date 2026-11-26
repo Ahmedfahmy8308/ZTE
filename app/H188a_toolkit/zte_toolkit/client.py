@@ -1,7 +1,10 @@
 import urllib.request
 import urllib.parse
 import http.cookiejar
+import http.client
 import ssl
+import socket
+import subprocess
 import hashlib
 import re
 import threading
@@ -24,8 +27,57 @@ def _clean_token(tok):
             pass
     return tok.replace("\\", "").strip()
 
+def _detect_h188a_source_ip(host="192.168.1.1", ctx=None):
+    """Find the local IPv4 interface that reaches the ZXHN H188A (avoiding H168N conflict)."""
+    try:
+        out = subprocess.check_output(["ipconfig"], text=True, errors="ignore", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        return None
+    ips = re.findall(r"IPv4 Address[^\:]*:\s*(\d+\.\d+\.\d+\.\d+)", out)
+    for ip in ips:
+        if ip.startswith("127.") or ip.startswith("169.254."):
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((ip, 0))
+            s.settimeout(1.5)
+            ss = ctx.wrap_socket(s, server_hostname=host) if ctx else s
+            ss.connect((host, 443))
+            ss.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+            chunks = []
+            total = 0
+            while total < 32768:
+                part = ss.recv(4096)
+                if not part:
+                    break
+                chunks.append(part)
+                total += len(part)
+                if b"</title>" in part.lower():
+                    break
+            ss.close()
+            html = b"".join(chunks).decode("utf-8", errors="ignore")
+            if "H168N" not in html and ("H188A" in html or "HTTP/1." in html):
+                return ip
+        except Exception:
+            continue
+    return None
+
+
+class _BoundHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context=None, source_ip=None):
+        super().__init__(context=context)
+        self.source_ip = source_ip
+
+    def https_open(self, req):
+        def _conn_factory(host, **kwargs):
+            if self.source_ip:
+                kwargs["source_address"] = (self.source_ip, 0)
+            return http.client.HTTPSConnection(host, context=self._context, **kwargs)
+        return self.do_open(_conn_factory, req)
+
+
 class ZTERouterClient:
-    def __init__(self, host="192.168.1.1", use_https=True, timeout=8):
+    def __init__(self, host="192.168.1.1", use_https=True, timeout=8, source_ip=None):
         self.host = host
         self.use_https = use_https
         self.proto = "https" if use_https else "http"
@@ -35,11 +87,14 @@ class ZTERouterClient:
         self.ctx = ssl.create_default_context()
         self.ctx.check_hostname = False
         self.ctx.verify_mode = ssl.CERT_NONE
+        self.source_ip = source_ip or _detect_h188a_source_ip(host, self.ctx)
+        if self.source_ip:
+            logger.info(f"Bound H188A client to interface {self.source_ip}")
         
         self.cj = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cj),
-            urllib.request.HTTPSHandler(context=self.ctx)
+            _BoundHTTPSHandler(context=self.ctx, source_ip=self.source_ip)
         )
         
         self.logged_in = False

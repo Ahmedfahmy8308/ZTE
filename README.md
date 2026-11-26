@@ -1,12 +1,12 @@
-# ZTE ZXHN H188A Management Toolkit & Firmware Analysis Suite
+# ZTE Unified Management Toolkit (ZXHN H188A & H168N V3.1)
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Router](https://img.shields.io/badge/Router-ZTE%20ZXHN%20H188A-purple.svg)](#)
-[![Firmware](https://img.shields.io/badge/Firmware-V2.0.1EG1T14__TE-green.svg)](#)
-[![Hardware](https://img.shields.io/badge/Hardware-V2.0.2-orange.svg)](#)
+[![Rust](https://img.shields.io/badge/Rust-1.100%2B-orange.svg)](https://www.rust-lang.org/)
+[![Routers](https://img.shields.io/badge/Routers-H188A%20%7C%20H168N%20V3.1-purple.svg)](#)
 [![ISP](https://img.shields.io/badge/ISP-Telecom%20Egypt%20(WE)-6F2C91.svg)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A dedicated, autonomous Python web management dashboard and binary firmware inspection suite engineered specifically for the **ZTE ZXHN H188A** (Hardware Version `V2.0.2`, Firmware `V2.0.1EG1T14_TE` distributed by Telecom Egypt / WE).
+A unified Python + Rust management dashboard, legacy TLS 1.0 reverse proxy, `config.bin` codec (`zcu-rs`), and binary firmware inspection suite for **ZTE ZXHN H188A** (`V2.0.1EG1T14_TE`) and **ZTE ZXHN H168N V3.1** (`V3.1.0_UEG1T5_TED` / `V3.1.0EG1T11_TE`) distributed by Telecom Egypt (WE).
 
 ---
 
@@ -47,6 +47,12 @@ A dedicated, autonomous Python web management dashboard and binary firmware insp
     - Validates SquashFS 4.0 root filesystem integrity (128KB blocks, LZMA, 1,648 inodes).
     - Calculates MD5 and SHA-256 checksums before staging for upgrade.
 
+- **ZXHN H168N V3.1 Rust Toolkit & Legacy TLS 1.0 Proxy (`h168n_toolkit`):**
+  - **Auto-Interface Discovery:** Automatically scans local IPv4 adapters (`Ethernet` vs `Wi-Fi`) to isolate and target `ZXHN H168N V3.1` even when both routers share `192.168.1.1`.
+  - **Built-in TLS 1.0 Reverse Proxy:** Bridges modern browsers (`http://127.0.0.1:8081`) to the router's legacy `TLSv1` (`@SECLEVEL=0`) HTTPS interface.
+  - **Access Point & Wi-Fi Manager:** Reads and updates SSID/WPA2 passphrase directly via `wizardcontrol.html` and guides LAN-to-LAN AP setup.
+  - **`zcu-rs` (`config.bin` Codec):** Native Rust `config.bin` encoder/decoder supporting Type-0 (ZLIB), Type-2 (AES-128-ECB for H168N V3.1), and Type-3/4 (AES-256-CBC + SHA-256 for H188A / H168N V3.5) with automatic key derivation.
+
 ---
 
 ## Directory Structure
@@ -54,27 +60,43 @@ A dedicated, autonomous Python web management dashboard and binary firmware insp
 ```text
 C:\Users\ahmed\Desktop\ZTE\
 │
-├── Run.bat                      # Single-click launcher (auto port check & browser launch)
+├── Run_H188a.bat                # Dedicated launcher for ZTE ZXHN H188A
+├── Run_H168n.bat                # Dedicated launcher for ZTE ZXHN H168N V3.1 (Web Dashboard + TLS 1.0 proxy)
 ├── README.md                    # Project documentation & reverse engineering teardown
 ├── CHANGELOG.md                 # Version release history and tracking
 ├── .gitignore                   # Git exclusion rules (credentials, logs, dumps)
 │
-├── app\                         # Core application package
-│   ├── web_app.py               # Standalone multi-threaded HTTP server & web UI
-│   ├── config.ini               # Router credentials and configuration
-│   ├── config.example.ini       # Template configuration
-│   ├── main.py                  # CLI management tool
+├── app\                         # Unified application package (H188A + H168N)
+│   ├── web_app.py               # Unified multi-threaded HTTP server & bilingual web UI
 │   ├── logs\                    # Daily operational logs
-│   └── zte_toolkit\             # Modular router interaction library
-│       ├── client.py            # HTTP session & token authentication engine
-│       ├── connection.py        # Safe PPPoE disconnect/connect manager
-│       ├── diagnostics.py       # VDSL & WAN status parser
-│       └── logger.py            # Sensitive data redacting logger
+│   ├── H188a_toolkit\           # ZTE ZXHN H188A Rust + Python toolkit
+│   │   ├── config.ini           # H188A router credentials (ignored by git)
+│   │   ├── config.example.ini   # H188A template configuration
+│   │   ├── Cargo.toml           # Rust workspace (zcu-rs + h188a-cli)
+│   │   ├── crates\
+│   │   │   ├── zcu-rs\          # Native Rust config.bin codec (Type-0/2/3/4 + auto-keygen)
+│   │   │   └── h188a-cli\       # Rust firmware inspector & Type-4 zcu CLI
+│   │   ├── main.py              # H188A CLI management tool
+│   │   └── zte_toolkit\         # H188A Python HTTP session, PPPoE & VDSL library
+│   └── H168n_toolkit\           # ZTE ZXHN H168N Rust + Python toolkit
+│       ├── config.ini           # H168N router & AP settings (ignored by git)
+│       ├── config.example.ini   # H168N template configuration
+│       ├── Cargo.toml           # Rust workspace (zcu-rs + h168n-cli)
+│       ├── crates\
+│       │   ├── zcu-rs\          # Native Rust config.bin codec (Type-0/2/3/4 + auto-keygen)
+│       │   └── h168n-cli\       # Adapter auto-detect, TLS 1.0 proxy, Wi-Fi & zcu CLI
+│       ├── main.py              # H168N CLI management tool
+│       └── zte_toolkit\         # H168N Python bridge, diagnostics & logger library
 │
-└── Firmware\                    # Firmware analysis workspace
-    ├── H188a.bin                # Official stock firmware binary (11.38 MB)
-    ├── rootfs.squashfs          # Carved SquashFS 4.0 root filesystem (7.38 MB)
-    └── extracted_sample\        # Extracted Lua and page components for analysis
+└── Firmware\                    # Symmetric firmware workspaces (H188A & H168N)
+    ├── H188a\                   # ZTE ZXHN H188A firmware & extracted rootfs
+    │   ├── H188a.bin
+    │   ├── rootfs.squashfs
+    │   └── extracted_sample\
+    └── H168n\                   # ZTE ZXHN H168N V3.1 Telecom Egypt firmware & extracted rootfs
+        ├── H168N_V3.1.0EG1T11_TE.bin
+        ├── rootfs.squashfs
+        └── extracted_sample\
 ```
 
 ---
@@ -84,10 +106,12 @@ C:\Users\ahmed\Desktop\ZTE\
 ### 1. Prerequisites
 - **Operating System:** Windows 10 / 11
 - **Python:** Python 3.10 or newer (tested with Python 3.11 x64)
-- **Network:** PC connected to ZTE router LAN (via Ethernet cable or Wi-Fi)
+- **Rust:** Rust / Cargo toolchain (required only to rebuild `h188a-cli` / `h168n-cli` / `zcu-rs` from source; zero external crates)
+- **Network:** PC connected to ZTE router LAN (via Ethernet cable and/or Wi-Fi)
 
 ### 2. Configuration
-Open `app\config.ini` and verify router settings:
+Each toolkit uses its own template configuration (auto-copied to `config.ini` on first launch):
+- `app\H188a_toolkit\config.example.ini` → `app\H188a_toolkit\config.ini`:
 ```ini
 [router]
 host = 192.168.1.1
@@ -99,25 +123,57 @@ cooldown_seconds = 6
 max_retries = 3
 verify_timeout = 45
 ```
+- `app\H168n_toolkit\config.example.ini` → `app\H168n_toolkit\config.ini`:
+```ini
+[router]
+model = ZXHN H168N V3.1
+target_ip = 192.168.1.1
+bind_ip = auto
+proxy_port = 8081
+username = admin
+password =
+
+[access_point]
+ap_lan_ip = 192.168.1.254
+disable_dhcp = true
+default_ssid = WE_8A6DF4
+```
 
 ### 3. Launching
-Double-click:
-```bat
-Run.bat
-```
-The script will automatically:
-1. Release port `8080` from any stale background processes.
-2. Initialize the local web server.
-3. Automatically launch your default browser to:
-   ```text
-   http://127.0.0.1:8080
-   ```
+Run the dedicated launcher for each router (both can run simultaneously without conflict):
+- **ZXHN H188A Dashboard (`http://127.0.0.1:8080`):**
+  ```bat
+  Run_H188a.bat
+  ```
+- **ZXHN H168N V3.1 Dashboard (`http://127.0.0.1:8082`) + TLS 1.0 Proxy (`http://127.0.0.1:8081`):**
+  ```bat
+  Run_H168n.bat
+  ```
+
+Each launcher automatically:
+1. Generates `config.ini` from `config.example.ini` if missing and compiles the Rust CLI if needed.
+2. Releases stale background processes on its ports (`8080` for H188A; `8081`/`8082` for H168N).
+3. Isolates the target router by network interface (`Wi-Fi` vs `Ethernet`) so dual `192.168.1.1` connections never collide.
+4. Opens your default browser directly to the dedicated router dashboard.
 
 ---
 
 ## In-Depth Firmware Reverse Engineering & Architectural Teardown
 
-A complete static and architectural analysis was performed on the official stock firmware binary (`Firmware\H188a.bin`). Below are the technical findings, partition layout, hardware specifications, and internal daemon structures.
+Static and architectural analyses were performed on both Telecom Egypt stock firmware binaries (`Firmware\H188a\H188a.bin` and `Firmware\H168n\H168N_V3.1.0EG1T11_TE.bin`). Below are the technical findings, partition layouts, hardware specifications, and internal daemon structures.
+
+### 0. ZXHN H168N V3.1 Firmware Summary (`H168N_V3.1.0EG1T11_TE.bin`)
+
+| Field | Value |
+| :--- | :--- |
+| **File Name** | `H168N_V3.1.0EG1T11_TE.bin` |
+| **File Size** | `7,496,640 bytes` (7.15 MB) |
+| **MD5 Checksum** | `61e9f3bf0c8167756f54475e6ec55a00` |
+| **SHA-256 Checksum** | `9a4288dd4ea45cd4fa7592b7949f4c455eaf29f9b7d4d3e00315f4d8cc6843d0` |
+| **Target Hardware** | **ZTE ZXHN H168N V3.1** (`THIS IS H168N VERSION`) |
+| **Software Version** | **`V3.1.0EG1T11_TE`** (Telecom Egypt / WE, built `2020-01-20 09:16:23`) |
+| **Kernel Partition** | `0x000128` — Linux `2.6.36` SMP MIPS32 Big-Endian (`4.61 MB` unpacked) |
+| **Root Filesystem** | `0x190000` — **SquashFS 4.0** LZMA (`5.59 MB`, `1,499` inodes) |
 
 ### 1. Firmware Identity & Cryptographic Hashes
 
@@ -267,36 +323,43 @@ Can this firmware be modified? **Yes, with strict precautions:**
    - Any added binaries or compiled tools must target **MIPS32 Big-Endian** with `uClibc` / `glibc` toolchain compatible with GCC 4.6.3 and Linux 3.18.21.
 3. **Flashing Safety:**
    - Never interrupt power during flash writes.
-   - Always retain the verified `Firmware\H188a.bin` stock binary as a golden recovery image.
+   - Always retain the verified `Firmware\H188a\H188a.bin` and `Firmware\H168n\H168N_V3.1.0EG1T11_TE.bin` binaries as golden recovery images.
 
 ---
 
 ## REST API Reference
 
-The local server exposes the following JSON endpoints:
+The local server exposes the following JSON/binary endpoints (routed according to `--mode h188a` or `--mode h168n`):
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `GET` | `/` | Web management dashboard HTML |
-| `GET` | `/api/status` | Live WAN IP and VDSL physical line telemetry |
+| `GET` | `/api/status` | Live WAN/DSL or H168N status telemetry |
 | `POST` | `/api/reconnect` | Triggers safe PPPoE session renewal (`dry_run` optional) |
 | `GET` | `/api/reconnect/status` | Polls progress and new WAN IP during reconnection |
 | `POST` | `/api/reboot` | Dispatches official router reboot command |
 | `GET` | `/api/logs` | Fetches router syslog entries with severity levels |
 | `POST` | `/api/clear-logs` | Clears local diagnostic log dumps |
 | `GET` | `/api/firmware/info` | Returns active firmware specs and local `.bin` file status |
-| `POST` | `/api/firmware/inspect` | Performs deep cryptographic inspection of firmware binary |
+| `POST` | `/api/firmware/inspect` | Performs deep cryptographic inspection of active mode firmware |
 | `POST` | `/api/firmware/upload` | Handles new `.bin` upload and safety verification |
+| `GET` | `/api/h168n/detect` | Scans local IPv4 adapters and identifies connected ZTE routers |
+| `GET` | `/api/h168n/info` | Queries ZXHN H168N Wi-Fi/radio status via bound Ethernet interface |
+| `POST` | `/api/h168n/login` | Authenticates to ZXHN H168N (SHA-256) and saves credentials |
+| `POST` | `/api/h168n/wifi` | Updates ZXHN H168N Wi-Fi SSID & WPA2 passphrase |
+| `POST` | `/api/h168n/proxy/start` | Starts the Rust TLS 1.0 reverse proxy (`http://127.0.0.1:8081`) |
+| `POST` | `/api/h168n/zcu/decode` | Decodes uploaded `config.bin` to XML using `zcu-rs` (auto-keygen supported) |
+| `POST` | `/api/h168n/zcu/encode` | Encodes uploaded XML back to `config.bin` (Type 2 / 3 / 4) using `zcu-rs` |
 
 ---
 
 ## Security & Safety
 
-- **Password Protection:** Router credentials in `config.ini` are strictly masked and scrubbed from all terminal and file log outputs via `RedactingFormatter`.
+- **Password Protection:** Router credentials in `config.ini` are strictly masked and scrubbed from all terminal and file log outputs via `RedactingFormatter`, and `config.ini` files are excluded via `.gitignore`.
 - **Non-Destructive Operations:** PPPoE renewal interacts solely with the WAN session and leaves Wi-Fi passwords, LAN DHCP, and VoIP configurations untouched.
 - **Flashing Guardrails:** Firmware upgrade tab requires multi-stage verification (Header Magic, Model Matching, Kernel LZMA test, SquashFS integrity) before allowing any flashing action.
 
 ---
 
 ## License
-MIT License. Created for educational, network diagnostic, and personal administration purposes.
+Distributed under the [MIT License](LICENSE). Created for educational, network diagnostic, and personal administration purposes.

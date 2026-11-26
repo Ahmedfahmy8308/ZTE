@@ -1,9 +1,35 @@
 # Changelog
 
-All notable changes to the **ZTE ZXHN H188A Management Toolkit & Firmware Analysis Suite** are documented in this file.
+All notable changes to the **ZTE Unified Management Toolkit (ZXHN H188A & H168N V3.1)** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [3.0.0] - 2026-11-26
+
+### Added
+- **Multi-Router Architecture (`H188a_toolkit` & `H168n_toolkit`):**
+  - Reorganized `app/` into symmetric Rust + Python + HTML toolkits for both **ZXHN H188A** and **ZXHN H168N V3.1**.
+  - Added dedicated per-router launchers: `Run_H188a.bat` (`http://127.0.0.1:8080`, `--mode h188a`) and `Run_H168n.bat` (`http://127.0.0.1:8082`, `--mode h168n` + TLS 1.0 proxy on `8081`).
+  - Added per-router `config.example.ini` templates, a root MIT `LICENSE` file, and updated `.gitignore` for Rust `target/`, `config.ini`, and extracted firmware artifacts.
+- **Native Rust Tooling (`zcu-rs`, `h168n-cli`, `h188a-cli`):**
+  - Built `zcu-rs` for `config.bin` decoding and encoding across Type-0 (ZLIB), Type-2 (AES-128-ECB), and Type-3/4 (AES-256-CBC + SHA-256) with automatic key derivation from signatures, serial numbers, and MAC addresses.
+  - Built `h168n-cli` with automatic network adapter discovery (`detect`), legacy `TLSv1` (`@SECLEVEL=0`) reverse proxy (`proxy` with `Content-Length` fast framing), Wi-Fi management (`set-wifi`), and `zcu-decode` / `zcu-encode`.
+  - Built `h188a-cli` with binary firmware inspection (`fw-inspect`), reachability checks (`ping`), and Type-4 `config.bin` support.
+- **Dual-Mode Web Dashboard (`web_app.py`):**
+  - Added isolated `--mode h188a` and `--mode h168n` dashboards with mode-aware firmware inspection (`POST /api/firmware/inspect`, `/api/firmware/upload`), adapter selector, SHA-256 login (`/api/h168n/login`), Wi-Fi/Access Point configuration, and browser-based `config.bin` decode/encode.
+- **Symmetric Firmware Workspace (`Firmware/`):**
+  - Split `Firmware/` into `Firmware/H188a/` and `Firmware/H168n/` (`H168N_V3.1.0EG1T11_TE.bin`), each with `rootfs.squashfs` and `extracted_sample/`.
+
+### Fixed
+- **Dual-Router IP Conflict (`192.168.1.1`):** Updated `H188a_toolkit/zte_toolkit/client.py` with `_BoundHTTPSHandler` to auto-detect and bind to the Wi-Fi interface (`H188A`) instead of routing to the Ethernet-connected `H168N`.
+- **Legacy TLS Proxy Latency:** Updated `h168n-cli` proxy response reader to terminate cleanly once `Content-Length` bytes are received instead of waiting for router socket EOF timeouts.
+- **H168N Mode Firmware Inspection:** Routed both `GET` and `POST` `/api/firmware/inspect` and `/api/firmware/upload` to `inspect_h168n_firmware` and updated UI labels when running in `--mode h168n`.
+
+### Removed
+- Removed legacy `Run.bat` in favor of dedicated `Run_H188a.bat` and `Run_H168n.bat` launchers.
 
 ---
 
